@@ -92,10 +92,10 @@ GitHub 单个文件上限 2 GiB，所以切成两片，下载、拼接、校验�
 
 ```powershell
 curl.exe -L -o fetch_model_release.ps1 https://github.com/Alex-Wang-88/qq-llm-bot/releases/download/qwen35-4b-sft-v2/fetch_model_release.ps1
-powershell -ExecutionPolicy Bypass -File .\fetch_model_release.ps1 -MirrorFirst
+powershell -ExecutionPolicy Bypass -File .\fetch_model_release.ps1
 ```
 
-GitHub 的 Release 资产走 `objects.githubusercontent.com`，国内常握手失败；脚本会自动降级到 `gh-proxy.com` 镜像（实测 4.35 MB/s），`-MirrorFirst` 是跳过直连那 12 秒超时。镜像只转发不篡改，最后仍用 SHA256 校验拼接结果。
+Release 资产会跳到 `objects.githubusercontent.com`，而 `curl` 不读 Windows 系统代理，所以「梯子开着 curl 仍握手失败」很常见。脚本按**系统代理 → 直连 → `gh-proxy.com` 镜像**自动挑路：走系统代理实测 10.17 MB/s（2.7 GB 约 4 分半），镜像 0.1–4.3 MB/s 波动很大。手工指定用 `-Proxy`，强制镜像用 `-MirrorFirst`。最后仍靠 SHA256 校验拼接结果。
 
 相对基座最明确的变化是**诚实性**：问"我发的照片里窗帘什么颜色"，基座编"深灰色的，带点暗纹，像百叶帘"，
 微调后回"我这边没有这张图，颜色看不出来"。代价是闲聊变短变生硬，长度主要靠上层人设撑。

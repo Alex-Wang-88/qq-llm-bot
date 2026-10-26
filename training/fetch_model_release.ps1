@@ -28,6 +28,10 @@
     覆盖下载根地址，用于自建镜像 / 内网分发 / 本地测试（例如 http://127.0.0.1:8765）。
     给定时不再拼接 GitHub 地址，也不再走 gh-proxy。
 
+.PARAMETER Proxy
+    显式指定 HTTP 代理（如 127.0.0.1:15732 或 http://127.0.0.1:15732）。不给时自动读
+    Windows 系统代理设置（VPN 客户端一般只改那里，而 curl 不读系统代理）。
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\fetch_model_release.ps1
 
@@ -41,10 +45,12 @@ param(
     [string]$OutDir = (Join-Path (Get-Location).Path 'models'),
     [string]$Mirror = 'https://gh-proxy.com/',
     [string]$BaseUrl = '',
+    [string]$Proxy = '',
     [string]$ExpectedMergedHash = '679b0f0ace7db44d25cf5e975e9ed6770f3bc049db2d4eb4d6f6d0221c0327b2',
     [long]$ExpectedMergedSize = 2708804096,
     [switch]$MirrorFirst,
     [switch]$NoMirror,
+    [switch]$NoProxy,
     [switch]$KeepParts,
     [switch]$Import,
     [switch]$Force
@@ -66,6 +72,37 @@ $ScriptName = 'fetch_model_release.ps1'
 
 $script:Curl = Get-Command curl.exe -ErrorAction SilentlyContinue
 $script:UsedMirror = $false
+
+# 代理：curl 不读 Windows 系统代理，而 VPN 客户端通常只改系统代理，
+# 所以这里主动取出来传给 curl，否则直连 GitHub 会握手失败。
+$script:ProxyUrl = ''
+if (-not $NoProxy) {
+    if ($Proxy -ne '') {
+        $script:ProxyUrl = $Proxy
+    } else {
+        try {
+            $ie = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+            if ($ie.ProxyEnable -eq 1 -and $ie.ProxyServer) {
+                $srv = [string]$ie.ProxyServer
+                if ($srv.Contains('=')) {
+                    $map = @{}
+                    foreach ($kv in $srv.Split(';')) {
+                        $pair = $kv.Split('=')
+                        if ($pair.Count -eq 2) { $map[$pair[0]] = $pair[1] }
+                    }
+                    if ($map.ContainsKey('https')) { $srv = $map['https'] }
+                    elseif ($map.ContainsKey('http')) { $srv = $map['http'] }
+                }
+                $script:ProxyUrl = $srv
+            }
+        } catch {
+            $script:ProxyUrl = ''
+        }
+    }
+}
+if ($script:ProxyUrl -ne '' -and $script:ProxyUrl -notmatch '^[a-zA-Z]+://') {
+    $script:ProxyUrl = "http://$($script:ProxyUrl)"
+}
 
 function Write-Step($text) { Write-Host "==> $text" -ForegroundColor Cyan }
 function Write-Ok($text)   { Write-Host "    $text" -ForegroundColor Green }
@@ -132,6 +169,8 @@ function Get-RemoteFile {
                 $curlArgs = @('-fL', '-C', '-', '--retry', '2', '--retry-delay', '2',
                               '--connect-timeout', '12', '--speed-limit', '2048', '--speed-time', '30')
                 if ($MaxTimeSec -gt 0) { $curlArgs += @('--max-time', "$MaxTimeSec") }
+                # -x 显式指定代理时已覆盖环境变量里的代理，不需要再加 --noproxy
+                if ($script:ProxyUrl -ne '') { $curlArgs += @('-x', $script:ProxyUrl) }
                 $curlArgs += @('-o', $Dest, $uri)
                 $code = Invoke-Native -Exe $script:Curl.Source -Arguments $curlArgs
                 if ($code -eq 0) {
@@ -141,7 +180,11 @@ function Get-RemoteFile {
                 $lastErr = "curl 退出码 $code"
             } else {
                 try {
-                    Invoke-WebRequest -Uri $uri -OutFile $Dest -UseBasicParsing
+                    if ($script:ProxyUrl -ne '') {
+                        Invoke-WebRequest -Uri $uri -OutFile $Dest -UseBasicParsing -Proxy $script:ProxyUrl
+                    } else {
+                        Invoke-WebRequest -Uri $uri -OutFile $Dest -UseBasicParsing
+                    }
                     return
                 } catch {
                     $lastErr = $_.Exception.Message
@@ -167,6 +210,12 @@ if (-not (Test-Path $OutDir)) {
     New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 }
 Write-Step "输出目录 $OutDir"
+
+if ($script:ProxyUrl -ne '') {
+    Write-Step "使用代理 $($script:ProxyUrl)"
+} elseif ($NoProxy) {
+    Write-Step '已按 -NoProxy 禁用代理'
+}
 
 if (-not $script:Curl) {
     Write-Note 'curl.exe 未找到，回退到 Invoke-WebRequest（不支持断点续传，大文件容易失败）'

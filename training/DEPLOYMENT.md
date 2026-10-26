@@ -49,10 +49,12 @@ Q4_K_M 已发布在 [`qwen35-4b-sft-v2`](https://github.com/Alex-Wang-88/qq-llm-
 
 ```powershell
 curl.exe -L -o fetch_model_release.ps1 https://github.com/Alex-Wang-88/qq-llm-bot/releases/download/qwen35-4b-sft-v2/fetch_model_release.ps1
-powershell -ExecutionPolicy Bypass -File .\fetch_model_release.ps1 -OutDir D:\models -MirrorFirst
+powershell -ExecutionPolicy Bypass -File .\fetch_model_release.ps1 -OutDir D:\models
 ```
 
-`-MirrorFirst` 建议默认带上：Release 资产会跳转到 `objects.githubusercontent.com`，国内常见的是握手失败或 0 字节卡死（本机实测直连 40 秒 0 字节，镜像 4.35 MB/s）。不加这个开关时脚本会先试直连、失败后自动降级镜像；失败会 `curl -C -` 断点续传，重跑即可接着下。
+**网络这一环容易卡住**：Release 资产从 `github.com` 302 跳到 `objects.githubusercontent.com`，而 `curl` 不读 Windows 系统代理 —— VPN 客户端通常只改系统代理，于是「梯子开着 curl 仍报 `schannel: failed to receive handshake`」。本机实测：环境里的另一个代理（58176）直连 40 秒 0 字节，镜像 0.1–4.3 MB/s，而系统代理（15732）**10.17 MB/s**，2.7 GB 约 4 分半。
+
+脚本因此按「系统代理 → 直连 → `gh-proxy.com` 镜像」的顺序自动挑路，VPN 开着时不用加任何参数。手工指定用 `-Proxy 127.0.0.1:15732`，禁用代理用 `-NoProxy`，GitHub 完全不通时 `-MirrorFirst` 可省掉每轮 12 秒连接超时。
 
 脚本先核对每个分片的 SHA256，按序拼接后再核对拼接结果的 SHA256（`679b0f0a…1c0327b2`）与字节数，任何一项对不上就报错并提示删掉重下；`-Import` 可在校验通过后顺手 `ollama create`。分片哈希、合并态哈希和手动拼接命令见 Release 说明页。
 
