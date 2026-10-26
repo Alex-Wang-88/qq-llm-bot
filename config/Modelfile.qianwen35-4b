@@ -1,0 +1,27 @@
+# 4B adapter 导出模型（Q4_K_M）
+#
+# 用法：
+#   1. 把 .training-local/gguf/qwen35-4b-sft-v2-Q4_K_M.gguf（2.52 GiB）放到本文件同级，
+#      或把下面的 FROM 改成该文件的绝对路径。
+#   2. ollama create qwen3.5:4b-qq-v2 -f config/Modelfile.qianwen35-4b
+#
+# 注意：这里刻意不写 SYSTEM。人设由上层（AstrBot / 代理）注入，与既有
+# Modelfile.qianwen35 的做法保持一致；把人设写死在这里会和运行时的
+# 会话策略重复，也会让 qianwen35_persona.txt 变成两个事实来源。
+
+FROM ./qwen35-4b-sft-v2-Q4_K_M.gguf
+
+PARAMETER num_ctx 8192
+PARAMETER num_thread 4
+PARAMETER temperature 0.7
+PARAMETER top_p 0.8
+PARAMETER top_k 20
+PARAMETER presence_penalty 1.5
+
+# 关于 thinking：
+# 这个模型默认会先输出思考过程。实测（llama.cpp b11900）在 enable_thinking
+# 未关闭时，48 个 token 全部花在思考上，没有正文。Ollama 关闭它的写法随版本
+# 变化（PARAMETER think false / PARAMETER chat_template_kwargs / 请求体传 think），
+# 本项目尚未在真实 Ollama 上验证哪一种生效，所以不在这里写死一条可能被忽略
+# 的配置。部署后请用下面的判据确认：
+#   发一句普通问候，若输出里出现 "[Start thinking]" 或 "<think>" 即未生效。
