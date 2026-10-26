@@ -4,13 +4,15 @@
 它记录的是把一个小模型调到**像个真人在 QQ 上说话**的过程：压住输出预算、管住气泡数量、
 管住它别把"我这就去查"当成回答发出去，以及顺手接了个只读查本机 Codex 会话的入口。
 
-跑在本机 AMD 16 核 / 31 GB / RTX 5060 8 GB 上，单路推理，够用。
+跑在本机 AMD Ryzen 7 7800X3D（8 核）/ 47 GB 内存 / Radeon RX 9070 XT（16 GB 显存）上，
+单路推理，够用。实测环境记录在 `training/EXPERIMENT_REPORT.md`。
 
 ## 结构
 
 | 路径 | 作用 |
 | --- | --- |
-| `ollama_fix_proxy.py` | 8899 端口上的兼容代理。拍平 text parts、`reasoning`→`reasoning_content`、按 `response_budget` 限 token（brief 384 / expanded 2048）、串行转发 |
+| `ollama_fix_proxy.py` | 8899 端口上的兼容代理。拍平 text parts、`reasoning`→`reasoning_content`、按 `response_budget` 限 token（brief 384 / expanded 2048）、串行转发、出口净化 |
+| `assistant_output_guard.py` | 出口净化：剥掉模型自己续写的 `user`/`assistant` 轮与 `<think>` 块，流式与非流式结果逐字一致 |
 | `assistant_dialogue.py` | 廉价意图分类（chat / query / computer / harness），只影响策略，不改权限 |
 | `assistant_security.py` | 出站文本脱敏 |
 | `assistant_harness/` | Codex App Server 的 JSONL 传输层与能力适配器，只读查询会话与额度 |
@@ -19,7 +21,7 @@
 | `data/plugins/astrbot_plugin_searxng_search/` | 搜索插件（正文提取部分被改过） |
 | `config/` | 人设、Ollama Modelfile、模型档位 |
 | `scripts/` | 启动、预检、离线探针 |
-| `tests/` | 回归测试，70 项 |
+| `tests/` | 回归测试，85 项 |
 
 ## 修过的几个坑
 
@@ -36,6 +38,12 @@
    同时存在时，PowerShell 5.1 复制环境块抛 `ArgumentException`，脚本在写任何日志之前就退出。
 5. **默认的"分段回复"按句号切。** 判定是 `len(text) > 阈值` 时**不分段**，很容易被误读成相反行为，
    实际效果是短回复被切碎、长回复整条发。本仓库把阈值设 0，气泡数改由插件按内容结构决定。
+6. **让回复变长，会带出角色边界失控。** 微调后的 4B 不再说完一句就停，但也开始自己续写
+   `user`/`assistant` 行和空 `<think>` 块，一路循环到 token 上限——有 26 个评测用例里 1 条这样。
+   训练集里这两个东西一个都没有，所以这是基座的对话先验，不是重训能收敛掉的。
+   `assistant_output_guard.py` 在代理出口做兜底：整行只有角色名就截断、剥掉 think 块、
+   流式输出与整段输出结果逐字一致（否则流式会漏）。78 条真实评测输出回放，只改动该改的 2 条，
+   其余 76 条一字未动。
 
 细节和证据都在 `开发进度.md`。
 
@@ -60,8 +68,11 @@ ollama create qwen3.5:9b-qq -f config/Modelfile.qianwen35
 ## 测试
 
 ```bash
-python -m unittest tests.test_harness tests.test_chat_tuning tests.test_dialogue tests.test_security
+python -m unittest tests.test_harness tests.test_chat_tuning tests.test_dialogue tests.test_security tests.test_output_guard
 ```
+
+`test_chat_tuning` 需要装了 AstrBot 的环境（`training/.venv-bot-tests/` 里有一份 4.29.3）。
+其中 1 项失败、3 项错误是环境问题而非代码问题：表情包分类数据没入库、真实运行配置没上传。
 
 离线探针（不发 QQ，可反复跑）：
 

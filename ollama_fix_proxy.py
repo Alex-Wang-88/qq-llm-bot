@@ -1,6 +1,7 @@
 """Loopback Ollama compatibility proxy; serial inference and scoped chat budgets."""
 
 import json
+import logging
 import os
 from pathlib import Path
 import threading
@@ -8,12 +9,14 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from assistant_security import redact
+from assistant_output_guard import StreamGuard, sanitize_text
 
 TARGET = os.environ.get("QQ_BOT_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 ROOT = Path(__file__).resolve().parent
 POLICY_MARKER = "<!-- local_chat_policy:v1 -->"
 BACKEND_LOCK = threading.Lock()
 HOP_HEADERS = {"transfer-encoding", "content-length", "connection", "keep-alive"}
+LOG = logging.getLogger(__name__)
 
 
 def flatten_content(messages):
@@ -70,6 +73,48 @@ def normalize_sse_line(line):
     return line
 
 
+def guard_response(data):
+    """Drop fabricated turns and stray think blocks from a non-streamed reply."""
+    for choice in data.get('choices',[]):
+        for key in ('message','delta'):
+            message=choice.get(key)
+            if not isinstance(message,dict):continue
+            content=message.get('content')
+            if not isinstance(content,str) or not content:continue
+            clean,info=sanitize_text(content)
+            if not info.get('changed'):continue
+            message['content']=clean
+            LOG.warning('output guard cleaned %s: %s',key,{k:v for k,v in info.items() if k!='changed'})
+    return data
+
+
+def guard_sse_line(line,guard):
+    """Filter one streamed line. Returns a list: flushing can add a trailing delta."""
+    if not line.startswith(b'data:'):return [line]
+    payload=line[5:].strip()
+    if payload==b'[DONE]':
+        pending=guard.flush()
+        if not pending:return [line]
+        extra=b'data: '+json.dumps({'choices':[{'index':0,'delta':{'content':pending}}]},ensure_ascii=False).encode('utf-8')+b'\n'
+        return [extra,line]
+    if not payload:return [line]
+    try:data=json.loads(payload)
+    except (ValueError,TypeError):return [line]
+    for choice in data.get('choices',[]):
+        delta=choice.get('delta')
+        if not isinstance(delta,dict):continue
+        content=delta.get('content')
+        if isinstance(content,str) and content:
+            kept=guard.feed(content)
+            if kept:delta['content']=kept
+            else:delta.pop('content',None)
+        if guard.blocked:
+            # The turn was cut; tell the client to stop instead of waiting for more.
+            choice['finish_reason']='stop'
+            LOG.warning('output guard truncated a streamed reply at a role marker')
+    return [b'data: '+json.dumps(normalize_reasoning(data),ensure_ascii=False).encode('utf-8')+b'\n']
+
+
 class Handler(BaseHTTPRequestHandler):
     def _reply(self, status, body, content_type="application/json"):
         try:
@@ -104,13 +149,17 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_header("Connection", "close")
                         self.end_headers()
                         self.close_connection = True
+                        guard=StreamGuard()
                         for line in resp:
-                            if self.path == '/v1/chat/completions':line=normalize_sse_line(line)
-                            self.wfile.write(line)
-                            self.wfile.flush()
+                            if self.path != '/v1/chat/completions':
+                                self.wfile.write(line);self.wfile.flush();continue
+                            for chunk in guard_sse_line(line,guard):
+                                self.wfile.write(chunk);self.wfile.flush()
                     else:
                         result=resp.read()
-                        if self.path == '/v1/chat/completions':result=json.dumps(normalize_reasoning(json.loads(result)),ensure_ascii=False).encode('utf-8')
+                        if self.path == '/v1/chat/completions':
+                            data=guard_response(normalize_reasoning(json.loads(result)))
+                            result=json.dumps(data,ensure_ascii=False).encode('utf-8')
                         self._reply(resp.status, result, resp.headers.get("Content-Type", "application/json"))
         except urllib.error.HTTPError as exc:
             self._reply(exc.code, exc.read(), exc.headers.get("Content-Type", "application/json"))
