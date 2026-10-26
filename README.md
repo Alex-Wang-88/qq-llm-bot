@@ -21,7 +21,7 @@
 | `data/plugins/astrbot_plugin_searxng_search/` | 搜索插件（正文提取部分被改过） |
 | `config/` | 人设、Ollama Modelfile、模型档位 |
 | `scripts/` | 启动、预检、离线探针 |
-| `tests/` | 回归测试，85 项 |
+| `tests/` | 回归测试，88 项 |
 
 ## 修过的几个坑
 

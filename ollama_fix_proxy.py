@@ -103,6 +103,7 @@ def guard_sse_line(line,guard):
     for choice in data.get('choices',[]):
         delta=choice.get('delta')
         if not isinstance(delta,dict):continue
+        was_blocked=guard.blocked
         content=delta.get('content')
         if isinstance(content,str) and content:
             kept=guard.feed(content)
@@ -111,7 +112,7 @@ def guard_sse_line(line,guard):
         if guard.blocked:
             # The turn was cut; tell the client to stop instead of waiting for more.
             choice['finish_reason']='stop'
-            LOG.warning('output guard truncated a streamed reply at a role marker')
+            if not was_blocked:LOG.warning('output guard truncated a streamed reply at a role marker')
     return [b'data: '+json.dumps(normalize_reasoning(data),ensure_ascii=False).encode('utf-8')+b'\n']
 
 
