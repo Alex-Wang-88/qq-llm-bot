@@ -41,6 +41,25 @@ Qwen3.5 的 `config.json` 写着 `text_config.mtp_num_hidden_layers: 1`，原始
 
 推荐做法：在已有环境完成导出，只把 2.52 GiB 的 GGUF 拷到推理机，避免重建 CUDA 环境与重下 8.7 GiB 原始权重。
 
+### 产物已发布到 Release，目标机不用再传文件
+
+Q4_K_M 已发布在 [`qwen35-4b-sft-v2`](https://github.com/Alex-Wang-88/qq-llm-bot/releases/tag/qwen35-4b-sft-v2)。GitHub 单个 asset 上限 2 GiB，而模型是 2.52 GiB（2 708 804 096 字节），因此切成 `part-00`（1400 MiB）+ `part-01`，按序拼回来与原始文件逐字节相同。
+
+目标机上一条命令完成下载、拼接、校验：
+
+```powershell
+curl.exe -L -o fetch_model_release.ps1 https://github.com/Alex-Wang-88/qq-llm-bot/releases/download/qwen35-4b-sft-v2/fetch_model_release.ps1
+powershell -ExecutionPolicy Bypass -File .\fetch_model_release.ps1 -OutDir D:\models -MirrorFirst
+```
+
+`-MirrorFirst` 建议默认带上：Release 资产会跳转到 `objects.githubusercontent.com`，国内常见的是握手失败或 0 字节卡死（本机实测直连 40 秒 0 字节，镜像 4.35 MB/s）。不加这个开关时脚本会先试直连、失败后自动降级镜像；失败会 `curl -C -` 断点续传，重跑即可接着下。
+
+脚本先核对每个分片的 SHA256，按序拼接后再核对拼接结果的 SHA256（`679b0f0a…1c0327b2`）与字节数，任何一项对不上就报错并提示删掉重下；`-Import` 可在校验通过后顺手 `ollama create`。分片哈希、合并态哈希和手动拼接命令见 Release 说明页。
+
+**注意 1**：仓库里其他 `.ps1` 是无 BOM 的 UTF-8，PowerShell 5.1 在非 UTF-8 系统区域设置下会按 ANSI 解码、把中文串搞坏。`fetch_model_release.ps1` 因此带 BOM，改动它时别把 BOM 去掉。
+
+**注意 2**：脚本里调 curl 时临时把 `$ErrorActionPreference` 降到 `Continue`。curl 的进度条写 stderr，而 PowerShell 5.1 在 `Stop` 下会把任何 stderr 输出升级成终止性 `NativeCommandError` —— 这个坑和 `run.ps1` 被管道打断是同一类。成败一律看退出码，不看 stderr。
+
 5. 创建新名称，例如 `qwen3.5:4b-qq-v2`。仓库内已提供 `config/Modelfile.qianwen35-4b`，把 `FROM` 改成实际 GGUF 路径后：
 
 ```powershell

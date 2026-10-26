@@ -21,6 +21,7 @@
 | `data/plugins/astrbot_plugin_searxng_search/` | 搜索插件（正文提取部分被改过） |
 | `config/` | 人设、Ollama Modelfile、模型档位 |
 | `scripts/` | 启动、预检、离线探针 |
+| `training/` | 离线微调工作区：数据构建、训练、评测、adapter 合并、GGUF 导出，入口 `training/README.md` |
 | `tests/` | 回归测试，88 项 |
 
 ## 修过的几个坑
@@ -82,6 +83,23 @@ python -m unittest tests.test_harness tests.test_chat_tuning tests.test_dialogue
 | `scripts/probe_announcement.py` | 统计"工具调用那一轮还写了字"的比例 |
 | `scripts/probe_codex_harness.py` | Codex App Server 握手 + 会话 + 额度 |
 | `scripts/probe_harness_command.py` | 把 `/助手` 三个命令的回复原样渲染出来 |
+
+## 微调的 4B 模型在哪
+
+`training/` 训出来的 4B（Qwen3.5-4B + 人格 SFT v2，Q4_K_M，2.52 GiB）发布在
+[`qwen35-4b-sft-v2`](https://github.com/Alex-Wang-88/qq-llm-bot/releases/tag/qwen35-4b-sft-v2)。
+GitHub 单个文件上限 2 GiB，所以切成两片，下载、拼接、校验一步做完：
+
+```powershell
+curl.exe -L -o fetch_model_release.ps1 https://github.com/Alex-Wang-88/qq-llm-bot/releases/download/qwen35-4b-sft-v2/fetch_model_release.ps1
+powershell -ExecutionPolicy Bypass -File .\fetch_model_release.ps1 -MirrorFirst
+```
+
+GitHub 的 Release 资产走 `objects.githubusercontent.com`，国内常握手失败；脚本会自动降级到 `gh-proxy.com` 镜像（实测 4.35 MB/s），`-MirrorFirst` 是跳过直连那 12 秒超时。镜像只转发不篡改，最后仍用 SHA256 校验拼接结果。
+
+相对基座最明确的变化是**诚实性**：问"我发的照片里窗帘什么颜色"，基座编"深灰色的，带点暗纹，像百叶帘"，
+微调后回"我这边没有这张图，颜色看不出来"。代价是闲聊变短变生硬，长度主要靠上层人设撑。
+这个产物**不能读图**——导出时只保留了语言塔。
 
 ## 仓库里没有的东西
 
