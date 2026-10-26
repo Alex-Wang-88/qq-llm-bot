@@ -1,0 +1,9 @@
+{
+  "size": "4B", "cpu_layers": 0, "precision": "bfloat16", "adapter_precision": "float32",
+  "rank": 8, "alpha": 16, "seed": 3407, "max_length": 1024,
+  "micro_batch_size": 1, "gradient_accumulation": 4, "epochs": 1,
+  "learning_rate": 0.0001, "gradient_checkpointing": true,
+  "optimizer": "torch.optim.AdamW", "foreach": false, "fused": false,
+  "cpu_reference": false, "validation_every": 15, "checkpoint_every": 15,
+  "max_step_seconds": 120, "run_name": "4b-bf16-sft-v1"
+}

@@ -1,0 +1,9 @@
+{
+  "size": "9B", "cpu_layers": 12, "precision": "bfloat16", "adapter_precision": "float32",
+  "rank": 8, "alpha": 16, "seed": 3407, "max_length": 512,
+  "micro_batch_size": 1, "gradient_accumulation": 1, "steps": 12,
+  "learning_rate": 0.0003, "gradient_checkpointing": true,
+  "optimizer": "torch.optim.AdamW", "foreach": false, "fused": false,
+  "overfit_records": 2, "cpu_reference": false, "validation_every": 6,
+  "checkpoint_every": 6, "max_step_seconds": 120, "run_name": "9b-bf16-overfit"
+}

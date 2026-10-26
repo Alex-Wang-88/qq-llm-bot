@@ -1,0 +1,8 @@
+# Optional conversion helpers. Install with --no-deps after requirements.txt;
+# never install llama.cpp's generic requirements over the ROCm torch baseline.
+sentencepiece==0.2.1
+protobuf==4.25.8
+requests==2.34.2
+charset-normalizer==3.5.2
+urllib3==2.8.0
+tiktoken==0.14.0

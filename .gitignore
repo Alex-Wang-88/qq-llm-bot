@@ -29,3 +29,17 @@ searxng/settings.yml
 # 角色形象素材，仅本地使用
 千问.png
 千问.avif
+
+# Isolated training environment, weights, private data, caches and raw evidence
+/.training-local/
+/training/.venv*/
+/training/artifacts/
+/training/cache/
+/training/checkpoints/
+/training/private_data/
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.ckpt
+*.onnx
