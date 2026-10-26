@@ -1,0 +1,8 @@
+{
+  "searxng_url": {
+    "description": "SearXNG 服务地址",
+    "hint": "本机 Docker 容器的 SearXNG 地址，JSON API 需在 SearXNG 配置中开启 formats: json",
+    "type": "string",
+    "default": "http://127.0.0.1:8888"
+  }
+}

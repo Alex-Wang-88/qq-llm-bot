@@ -1,0 +1,18 @@
+{
+  "qwen3": {
+    "model": "qwen3:8b-qq",
+    "source_model": "qwen3:8b",
+    "context_tokens": 8192,
+    "modalities": ["text","tool_use"],
+    "persona_file": "config/qianwen_persona.txt",
+    "generation": {"temperature":0.7,"top_p":0.8,"frequency_penalty":0.4,"presence_penalty":0.3,"max_tokens":2048}
+  },
+  "qwen35": {
+    "model": "qwen3.5:9b-qq",
+    "source_model": "qwen3.5:9b-q4_K_M",
+    "context_tokens": 8192,
+    "modalities": ["text","image","tool_use"],
+    "persona_file": "config/qianwen35_persona.txt",
+    "generation": {"temperature":0.7,"top_p":0.8,"presence_penalty":1.5,"max_tokens":2048}
+  }
+}

@@ -1,0 +1,81 @@
+# qq-llm-bot
+
+把本机 Ollama 上的 `qwen3.5:9b` 接成 QQ 官方机器人。这个仓库不是"跑通一个 LLM 机器人"的模板，
+它记录的是把一个小模型调到**像个真人在 QQ 上说话**的过程：压住输出预算、管住气泡数量、
+管住它别把"我这就去查"当成回答发出去，以及顺手接了个只读查本机 Codex 会话的入口。
+
+跑在本机 AMD 16 核 / 31 GB / RTX 5060 8 GB 上，单路推理，够用。
+
+## 结构
+
+| 路径 | 作用 |
+| --- | --- |
+| `ollama_fix_proxy.py` | 8899 端口上的兼容代理。拍平 text parts、`reasoning`→`reasoning_content`、按 `response_budget` 限 token（brief 384 / expanded 2048）、串行转发 |
+| `assistant_dialogue.py` | 廉价意图分类（chat / query / computer / harness），只影响策略，不改权限 |
+| `assistant_security.py` | 出站文本脱敏 |
+| `assistant_harness/` | Codex App Server 的 JSONL 传输层与能力适配器，只读查询会话与额度 |
+| `data/plugins/astrbot_plugin_chat_natural/` | 聊天策略：工具白名单、历史清理、气泡形状、表情节奏 |
+| `data/plugins/astrbot_plugin_harness_manager/` | `/助手` 命令：查会话、读结果、查额度 |
+| `data/plugins/astrbot_plugin_searxng_search/` | 搜索插件（正文提取部分被改过） |
+| `config/` | 人设、Ollama Modelfile、模型档位 |
+| `scripts/` | 启动、预检、离线探针 |
+| `tests/` | 回归测试，70 项 |
+
+## 修过的几个坑
+
+这个仓库真正值钱的是这几条，都是实测出来的，不是猜的：
+
+1. **`provider.modalities` 少写 `tool_use`，工具会静默全丢。** AstrBot 在
+   `_func_tool_for_provider()` 里发现能力声明不含 `tool_use` 就直接返回 `None`，请求里连 `tools`
+   字段都没有，日志只有 debug 级别一行。表现是模型嘴上说"我去搜"，但从来没有工具调用。
+2. **历史里的 `&&search&&` 会把工具调用饿死。** 模型把表情语法错当工具语法，写进历史后每轮复读。
+   实测带标记时工具调用 1/3 次，剥离后 3/3。
+3. **工具调用那一轮的文本会单独变成一条消息。** `tool_loop_agent_runner.py` 每轮都 yield 一个
+   `llm_result`，带不带工具调用都一样，所以"好的，我这就去查一下。"会先于工具结果发出去。
+4. **`Start-Process` 遇上大小写重复的环境变量会整脚崩掉。** `HTTPS_PROXY` 与 `https_proxy`
+   同时存在时，PowerShell 5.1 复制环境块抛 `ArgumentException`，脚本在写任何日志之前就退出。
+5. **默认的"分段回复"按句号切。** 判定是 `len(text) > 阈值` 时**不分段**，很容易被误读成相反行为，
+   实际效果是短回复被切碎、长回复整条发。本仓库把阈值设 0，气泡数改由插件按内容结构决定。
+
+细节和证据都在 `开发进度.md`。
+
+## 启动
+
+前置：AstrBot 4.29（`uv tool install astrbot`）、Ollama、searxng（docker，用
+`searxng/settings.example.yml` 生成 `settings.yml`）、Codex CLI（可选，只影响 `/助手`）。
+
+```bat
+start_all.bat
+```
+
+它做四件事：资源预检 → 确保 Ollama 在跑 → 起 8899 代理 → 起 AstrBot 并等 6185 就绪。
+每一步都写进 `data/logs/startup.log`，失败会打印退出码和日志末几行。
+
+模型要自己建一次：
+
+```bash
+ollama create qwen3.5:9b-qq -f config/Modelfile.qianwen35
+```
+
+## 测试
+
+```bash
+python -m unittest tests.test_harness tests.test_chat_tuning tests.test_dialogue tests.test_security
+```
+
+离线探针（不发 QQ，可反复跑）：
+
+| 脚本 | 用途 |
+| --- | --- |
+| `scripts/probe_toolcall.py` | 重放真实请求，看工具调用率 |
+| `scripts/probe_announcement.py` | 统计"工具调用那一轮还写了字"的比例 |
+| `scripts/probe_codex_harness.py` | Codex App Server 握手 + 会话 + 额度 |
+| `scripts/probe_harness_command.py` | 把 `/助手` 三个命令的回复原样渲染出来 |
+
+## 仓库里没有的东西
+
+`data/` 只保留三个插件的源码，其余（机器人 appid/secret、会话库、日志、表情包、
+面板密码哈希）都不入库。`searxng/settings.yml` 和角色形象图也不入库。
+`开发进度.md` 里会出现本机绝对路径，介意的话自己裁掉。
+
+个人自用项目，不提供支持。

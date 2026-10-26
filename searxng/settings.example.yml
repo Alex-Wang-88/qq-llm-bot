@@ -1,0 +1,20 @@
+use_default_settings: true
+
+server:
+  # 换成自己的：openssl rand -hex 32
+  secret_key: "replace-with-your-own-secret"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+
+outgoing:
+  # 本机代理地址。如果容器能直接出网，把这段删掉。
+  proxy: "http://host.docker.internal:15732"
+  request_timeout: 6.0
+  max_request_timeout: 12.0
+  useragent_suffix: ""

@@ -1,0 +1,7 @@
+name: astrbot_plugin_harness_manager
+display_name: 私人 Harness 管理
+desc: 通过正式 Codex App Server 查询已有会话、结果和额度；私聊白名单与明确会话路由。
+version: v0.1.0
+author: qq-llm-bot
+repo: local
+astrbot_version: ">=4.29,<5"

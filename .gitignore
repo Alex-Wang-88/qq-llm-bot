@@ -1,0 +1,31 @@
+# AstrBot 运行时数据：机器人凭据、会话库、日志、表情包都在这下面，不入库
+/data/*
+!/data/plugins/
+/data/plugins/*
+!/data/plugins/astrbot_plugin_chat_natural/
+!/data/plugins/astrbot_plugin_harness_manager/
+!/data/plugins/astrbot_plugin_searxng_search/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 本地环境
+.workbuddy/
+.astrbot
+astrbot.lock
+backups/
+_plugins/
+.env
+*.env
+
+# 兼容代理落盘的原始请求快照，含完整对话内容
+_last_request.json
+_last_forwarded_request.json
+
+# 本机 searxng 实例配置，由 settings.example.yml 生成
+searxng/settings.yml
+
+# 角色形象素材，仅本地使用
+千问.png
+千问.avif

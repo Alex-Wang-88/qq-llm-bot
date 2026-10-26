@@ -1,0 +1,6 @@
+name: astrbot_plugin_searxng_search
+display_name: 本地SearXNG联网搜索
+desc: 把本机自建的 SearXNG 元搜索引擎接入 AstrBot，为 LLM 提供联网搜索(web_search)和网页正文读取(fetch_web_page)两个工具，无需任何第三方 API key
+version: v1.0.0
+author: qq-llm-bot
+repo: local

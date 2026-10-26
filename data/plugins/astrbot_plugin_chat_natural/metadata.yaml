@@ -1,0 +1,7 @@
+name: astrbot_plugin_chat_natural
+display_name: 本地自然聊天调优
+desc: 为千问娘收敛工具、保持工具后口吻，并按需提示表情节奏。
+version: v1.0.0
+author: qq-llm-bot
+repo: local
+astrbot_version: ">=4.29,<5"

@@ -1,0 +1,5 @@
+{
+  "allowed_private_sessions":{"type":"list","description":"允许管理 Harness 的私聊 UMO 白名单","default":[]},
+  "exclusive_codex_sessions":{"type":"list","description":"已经明确独占交接给本服务的 Codex 会话 ID","default":[]},
+  "send_setup_message":{"type":"bool","description":"向已授权私聊发送一次接入测试通知","default":false}
+}
