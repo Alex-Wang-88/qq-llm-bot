@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import importlib.util
+import importlib
 import json
 from pathlib import Path
 import sys
@@ -10,7 +11,7 @@ import unittest
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,6 +28,8 @@ proxy = load("tuned_proxy", "ollama_fix_proxy.py")
 tuning = load("tuned_config", "scripts/apply_chat_tuning.py")
 web = load("page_extract", "data/plugins/astrbot_plugin_searxng_search/web_text.py")
 natural = load("natural_plugin_test", "data/plugins/astrbot_plugin_chat_natural/main.py")
+sys.path.insert(0, str(ROOT / "data/plugins"))
+search_plugin = importlib.import_module("astrbot_plugin_searxng_search.main")
 # 插件的闲置阈值状态默认落在 data/plugin_data/ 下；测试必须指到临时目录，
 # 否则 prepare_chat 会把假的 UMO 写进真实的 session_state.json。
 natural.SESSION_STATE = Path(tempfile.mkdtemp(prefix="chat-tuning-state-")) / "session_state.json"
@@ -50,6 +53,86 @@ class Event:
 
 
 class ChatPolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hapi_read_tools_require_admin_private_allowlist(self):
+        base=ROOT/'data/plugin-evaluation/fixture-tmp'
+        base.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='hapi-policy-fixture-',dir=base) as tmp:
+            root=Path(tmp)
+            self.assertTrue(root.resolve().is_relative_to(base.resolve()))
+            (root/'data/config').mkdir(parents=True)
+            (root/'data/config/astrbot_plugin_harness_manager_config.json').write_text(
+                json.dumps({'allowed_private_sessions':['test:FriendMessage:u1']}),encoding='utf-8')
+            for authorized in (False,True):
+                plugin=natural.NaturalChatPlugin(SimpleNamespace())
+                event=Event()
+                event.is_admin=lambda:authorized
+                event.is_private_chat=lambda:True
+                tools=SimpleNamespace(tools=[SimpleNamespace(name=n) for n in ['harness_query','hapi_coding_list_sessions','hapi_coding_send_message']])
+                tools.remove_tool=lambda name:tools.tools.__setitem__(slice(None),[x for x in tools.tools if x.name!=name])
+                req=SimpleNamespace(func_tool=tools,prompt='Codex 会话状态',system_prompt='')
+                with patch.object(natural,'ROOT',root):
+                    await plugin.prepare_chat(event,req)
+                names=[x.name for x in tools.tools]
+                self.assertEqual('hapi_coding_list_sessions' in names,authorized)
+                self.assertNotIn('hapi_coding_send_message',names)
+
+    async def test_ranked_search_records_only_actual_turn_sources(self):
+        plugin = search_plugin.SearxngSearchPlugin(SimpleNamespace(), {'use_searcher_pro': True})
+        event = Event()
+        event.set_extra('chat_natural_enabled', True)
+        fixture = [{'title':'虚构材料', 'url':'https://example.invalid/evidence', 'snippet':'测试'}]
+        with patch.object(plugin, 'ranked_results', new=AsyncMock(return_value=fixture)):
+            data = json.loads(await plugin.web_search(event, '虚构查询'))
+        self.assertEqual(data['results'], fixture)
+        self.assertEqual(event.get_extra('chat_natural_evidence_urls'), ['https://example.invalid/evidence'])
+
+    async def test_market_query_dispatches_snapshot_without_llm(self):
+        plugin = natural.NaturalChatPlugin(SimpleNamespace())
+        event = Event()
+        sent = []
+        async def send(message): sent.append(message)
+        event.send = send
+        event.stop_event = lambda: event.set_extra('stopped', True)
+        req = SimpleNamespace(func_tool=None, prompt='今天A股怎么样', system_prompt='')
+        with patch.object(natural, 'market_snapshot', return_value='fixture timestamped snapshot'):
+            await plugin.prepare_chat(event, req)
+        self.assertTrue(event.get_extra('stopped'))
+        self.assertIn('fixture timestamped snapshot', str(sent[0].chain[0].text))
+
+    async def test_search_failure_reports_no_evidence(self):
+        plugin = search_plugin.SearxngSearchPlugin(SimpleNamespace(), {})
+        event = Event()
+        event.set_extra('chat_natural_enabled', True)
+        class BrokenClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            async def get(self, *args, **kwargs): raise TimeoutError('offline fixture')
+        with patch.object(search_plugin.httpx, 'AsyncClient', return_value=BrokenClient()):
+            result = await plugin.web_search(event, 'fixture')
+        self.assertIn('搜索失败', result)
+        self.assertFalse(event.get_extra('chat_natural_evidence_urls'))
+
+    async def test_source_evidence_is_per_event_and_unverified_urls_removed(self):
+        plugin = natural.NaturalChatPlugin(SimpleNamespace())
+        event = Event()
+        await plugin.prepare_chat(event, SimpleNamespace(func_tool=None, prompt="请给来源", system_prompt=""))
+        search_plugin.record_evidence(event, ["https://example.com/page", "javascript:bad", "https://user:pass@example.com/"])
+        response = SimpleNamespace(completion_text="结果见 https://invented.example/a")
+        await plugin.note_meme(event, response)
+        self.assertNotIn("https://invented.example/a", response.completion_text)
+        self.assertIn("https://example.com/page", response.completion_text)
+        self.assertNotIn("user:pass", response.completion_text)
+        self.assertIsNone(Event().get_extra("chat_natural_evidence_urls"))
+
+    async def test_no_evidence_does_not_invent_sources(self):
+        plugin = natural.NaturalChatPlugin(SimpleNamespace())
+        event = Event()
+        await plugin.prepare_chat(event, SimpleNamespace(func_tool=None, prompt="请给来源", system_prompt=""))
+        response = SimpleNamespace(completion_text="搜索失败，无法核实。 https://invented.example/a")
+        await plugin.note_meme(event, response)
+        self.assertNotIn("https://invented.example/a", response.completion_text)
+        self.assertNotIn("检索结果", response.completion_text)
+
     async def test_removes_framework_added_tools_but_keeps_search(self):
         plugin = natural.NaturalChatPlugin(SimpleNamespace())
         tools = SimpleNamespace(tools=[SimpleNamespace(name=n) for n in ["web_search", "fetch_web_page", "future_task", "send_message_to_user"]])
@@ -126,7 +209,8 @@ class ChatPolicyTests(unittest.IsolatedAsyncioTestCase):
                                       {"role":"assistant","content":"好的，我马上搜索。"},
                                       {"role":"assistant","content":"行，再试一次。"},
                                       {"role":"user","content":"搜一下今天的 A 股行情"}])
-        await plugin.prepare_chat(Event(),req)
+        with patch.object(natural, 'is_simple_market_query', return_value=False):
+            await plugin.prepare_chat(Event(),req)
         self.assertEqual([m["role"] for m in req.contexts],["user"])
 
     async def test_preamble_keeps_its_tool_call_pair(self):
@@ -136,7 +220,8 @@ class ChatPolicyTests(unittest.IsolatedAsyncioTestCase):
                             contexts=[{"role":"assistant","content":[{"type":"text","text":"好的，我这就去查一下。"}],"tool_calls":[call]},
                                       {"role":"tool","content":"{}","tool_call_id":"c1"},
                                       {"role":"user","content":"搜一下今天的 A 股行情"}])
-        await plugin.prepare_chat(Event(),req)
+        with patch.object(natural, 'is_simple_market_query', return_value=False):
+            await plugin.prepare_chat(Event(),req)
         self.assertEqual(len(req.contexts),3)
         self.assertEqual(req.contexts[0]["content"],"")
         self.assertEqual(req.contexts[0]["tool_calls"],[call])
@@ -251,7 +336,7 @@ class BubbleShapeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(event.result.chain), 2)
 
     def test_punctuation_splitter_is_disabled(self):
-        cfg = json.loads((ROOT / "data/cmd_config.json").read_text(encoding="utf-8"))
+        cfg = json.loads((ROOT / "data/cmd_config.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(cfg["platform_settings"]["segmented_reply"]["words_count_threshold"], 0)
         copy_cfg = copy.deepcopy(cfg)
         tuning.tune_core(copy_cfg)
@@ -260,13 +345,25 @@ class BubbleShapeTests(unittest.IsolatedAsyncioTestCase):
     async def test_query_policy_asks_for_conclusion_first(self):
         plugin = self.plugin()
         req = SimpleNamespace(func_tool=None, prompt="搜一下今天的 A 股行情", system_prompt="")
-        await plugin.prepare_chat(Event(), req)
+        with patch.object(natural, 'is_simple_market_query', return_value=False):
+            await plugin.prepare_chat(Event(), req)
         self.assertIn("intent=query", req.system_prompt)
         self.assertIn("web_search", req.system_prompt)
         self.assertIn("最后一句停在结论上", req.system_prompt)
 
 
 class PurePolicyTests(unittest.TestCase):
+    def test_tool_preamble_removed_only_for_scoped_tool_calls(self):
+        def reply(text, calls):
+            return {'choices': [{'message': {'content': text, 'tool_calls': calls}}]}
+        calls = [{'id': 'c1'}]
+        text = '先按你的要求查 Python 3.14 的发布日期，然后看结果里有没有来源。'
+        self.assertEqual(proxy.guard_response(reply(text, calls), True)['choices'][0]['message']['content'], '')
+        self.assertEqual(proxy.guard_response(reply(text, []), True)['choices'][0]['message']['content'], text)
+        self.assertEqual(proxy.guard_response(reply(text, calls), False)['choices'][0]['message']['content'], text)
+        substantive = 'Python 3.14 发布于 2025 年，接下来查具体日期。'
+        self.assertEqual(proxy.guard_response(reply(substantive, calls), True)['choices'][0]['message']['content'], substantive)
+
     def test_text_parts_preserve_question_and_time(self):
         messages = [{"role": "user", "content": [{"type": "text", "text": "question"}, {"type": "text", "text": "time"}]}]
         proxy.flatten_content(messages)
@@ -305,7 +402,7 @@ class PurePolicyTests(unittest.TestCase):
         self.assertEqual(brief["reasoning_effort"],"none")
 
     def test_group_and_transport_settings_preserved(self):
-        cfg = json.loads((ROOT / "data/cmd_config.json").read_text(encoding="utf-8"))
+        cfg = json.loads((ROOT / "data/cmd_config.json").read_text(encoding="utf-8-sig"))
         before = copy.deepcopy(cfg)
         tuning.tune_core(cfg)
         for key in ["platform", "provider_ltm_settings", "wake_prefix"]:
@@ -318,7 +415,7 @@ class PurePolicyTests(unittest.TestCase):
         profiles = json.loads((ROOT / "config/model_profiles.json").read_text(encoding="utf-8"))
         for name, profile in profiles.items():
             self.assertIn("tool_use", profile["modalities"], f"profile {name} would lose all tool calls")
-        cfg = json.loads((ROOT / "data/cmd_config.json").read_text(encoding="utf-8"))
+        cfg = json.loads((ROOT / "data/cmd_config.json").read_text(encoding="utf-8-sig"))
         provider = next(p for p in cfg["provider"] if p["id"] == "ollama_local")
         self.assertIn("tool_use", provider["modalities"], "live provider would lose all tool calls")
         import sqlite3

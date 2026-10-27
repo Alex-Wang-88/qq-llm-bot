@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import threading
 import urllib.error
@@ -17,6 +18,9 @@ POLICY_MARKER = "<!-- local_chat_policy:v1 -->"
 BACKEND_LOCK = threading.Lock()
 HOP_HEADERS = {"transfer-encoding", "content-length", "connection", "keep-alive"}
 LOG = logging.getLogger(__name__)
+TOOL_PREAMBLE = re.compile(
+    r"^(?:(?:好的|好|行|嗯|收到)[，,\s]*我?(?:这就|马上|现在)?(?:去|来)?(?:查|搜|搜索|看一下)[^。！？!?]{0,70}|先按你的要求(?:查|搜)[^。！？!?]{0,100})[。！？!?]?$"
+)
 
 REQUEST_TIMEOUT = 120
 # 上下文溢出的补救阶梯，从最温和到最激进。实测（2026-10-27）单靠丢旧轮次治不了：
@@ -165,7 +169,7 @@ def normalize_sse_line(line):
     return line
 
 
-def guard_response(data):
+def guard_response(data, suppress_tool_preamble=False):
     """Drop fabricated turns and stray think blocks from a non-streamed reply."""
     for choice in data.get('choices',[]):
         for key in ('message','delta'):
@@ -173,6 +177,9 @@ def guard_response(data):
             if not isinstance(message,dict):continue
             content=message.get('content')
             if not isinstance(content,str) or not content:continue
+            if suppress_tool_preamble and message.get('tool_calls') and TOOL_PREAMBLE.fullmatch(content.strip()):
+                message['content'] = ''
+                continue
             clean,info=sanitize_text(content)
             if not info.get('changed'):continue
             message['content']=clean
@@ -290,7 +297,8 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         result=resp.read()
                         if self.path == '/v1/chat/completions':
-                            data=guard_response(normalize_reasoning(json.loads(result)))
+                            scoped = bool(payload and any(POLICY_MARKER in m.get('content', '') for m in payload.get('messages', []) if isinstance(m, dict) and m.get('role') == 'system' and isinstance(m.get('content'), str)))
+                            data=guard_response(normalize_reasoning(json.loads(result)), suppress_tool_preamble=scoped)
                             result=json.dumps(data,ensure_ascii=False).encode('utf-8')
                         self._reply(resp.status, result, resp.headers.get("Content-Type", "application/json"))
         except urllib.error.HTTPError as exc:

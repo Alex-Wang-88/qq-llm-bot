@@ -24,13 +24,16 @@
 | `assistant_calc.py` | 算术求值：`ast` 节点白名单 + `Fraction`，不用 `eval`。纯算式由代码直接回，句中算式只注入核验结果 |
 | `assistant_security.py` | 出站文本脱敏 |
 | `assistant_harness/` | Codex App Server 的 JSONL 传输层与能力适配器，只读查询会话与额度 |
-| `data/plugins/astrbot_plugin_chat_natural/` | 聊天策略：工具白名单、历史清理、气泡形状、表情节奏 |
+| `assistant_market.py` | A 股指数快照：腾讯行情、带时间戳、跨日或抓取失败一律说"无法确认" |
+| `assistant_hapi_local.py` | HAPI hub 的本地拉起与身份核验：只认本项目那个进程，才读它的 token |
+| `dashboard/` | 本机控制台（127.0.0.1:8765）：开关助手、看日志、显存看板、启动进度条 |
+| `data/plugins/astrbot_plugin_chat_natural/` | 聊天策略：工具白名单、历史清理、气泡形状、表情节奏、来源约束 |
 | `data/plugins/astrbot_plugin_harness_manager/` | `/助手` 命令：查会话、读结果、查额度 |
-| `data/plugins/astrbot_plugin_searxng_search/` | 搜索插件（正文提取部分被改过） |
+| `data/plugins/astrbot_plugin_searxng_search/` | 搜索插件（正文提取被改过；可选委托 WebSearcherPro 排序） |
 | `config/` | 人设、Ollama Modelfile、模型档位、会话闲置阈值（`session_policy.json`） |
 | `scripts/` | 启动、预检、离线探针 |
 | `training/` | 离线微调工作区：数据构建、训练、评测、adapter 合并、GGUF 导出，入口 `training/README.md` |
-| `tests/` | 回归测试，149 项 |
+| `tests/` | 回归测试，193 项 |
 
 ## 修过的几个坑
 
@@ -98,11 +101,12 @@ ollama create qwen3.5:9b-qq -f config/Modelfile.qianwen35
 ## 测试
 
 ```bash
-python -m unittest tests.test_harness tests.test_chat_tuning tests.test_dialogue tests.test_security tests.test_output_guard
+python -m unittest discover -s tests -v
 ```
 
-`test_chat_tuning` 需要装了 AstrBot 的环境（`training/.venv-bot-tests/` 里有一份 4.29.3）。
-其中 1 项失败、3 项错误是环境问题而非代码问题：表情包分类数据没入库、真实运行配置没上传。
+2026-10-27 全量 **193 项 OK**（23 秒）。要用装了 AstrBot 的解释器（
+`C:/Users/12992/AppData/Roaming/uv/tools/astrbot/Scripts/python.exe`），
+`test_chat_tuning` 会 import 插件本体。前端另跑 `node tests/test_dashboard_ui.js`。
 
 离线探针（不发 QQ，可反复跑）：
 
@@ -112,6 +116,8 @@ python -m unittest tests.test_harness tests.test_chat_tuning tests.test_dialogue
 | `scripts/probe_announcement.py` | 统计"工具调用那一轮还写了字"的比例 |
 | `scripts/probe_codex_harness.py` | Codex App Server 握手 + 会话 + 额度 |
 | `scripts/probe_harness_command.py` | 把 `/助手` 三个命令的回复原样渲染出来 |
+| `scripts/test_plugin_candidates.py` | 插件候选的离线契约测试（隔离假数据） |
+| `scripts/evaluate_chat_plugins.py` | 活人感 A/B 对照（真实调本地模型，串行） |
 
 ## 微调的 4B 模型在哪
 

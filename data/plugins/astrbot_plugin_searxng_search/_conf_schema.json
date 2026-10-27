@@ -1,4 +1,10 @@
 {
+  "use_searcher_pro": {
+    "description": "使用 WebSearcherPro 的通用搜索排序",
+    "hint": "启用后优先使用本地已安装的 WebSearcherPro；不可用时回退原搜索，仍记录本轮真实来源。",
+    "type": "bool",
+    "default": false
+  },
   "searxng_url": {
     "description": "SearXNG 服务地址",
     "hint": "本机 Docker 容器的 SearXNG 地址，JSON API 需在 SearXNG 配置中开启 formats: json",

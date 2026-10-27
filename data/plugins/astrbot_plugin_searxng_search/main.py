@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import json
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -24,11 +25,41 @@ _UA = (
 )
 
 
+def record_evidence(event, urls):
+    """Keep this event's successful tool URLs, never persist them across turns."""
+    if not event.get_extra("chat_natural_enabled"):
+        return
+    saved = list(event.get_extra("chat_natural_evidence_urls") or [])
+    for url in urls:
+        try:
+            parsed = urlsplit(url)
+            valid = parsed.scheme in ("http", "https") and parsed.hostname and not parsed.username and not parsed.password
+        except (ValueError, TypeError):
+            valid = False
+        if valid and url not in saved:
+            saved.append(url)
+    event.set_extra("chat_natural_evidence_urls", saved[:5])
+
+
 class SearxngSearchPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         cfg = config or {}
         self.base_url = str(cfg.get("searxng_url") or "http://127.0.0.1:8888").rstrip("/")
+        self.use_searcher_pro = bool(cfg.get("use_searcher_pro", False))
+
+    async def ranked_results(self, query, limit):
+        """Optional Pro ranking, returning only evidence from actual results."""
+        try:
+            from data.plugins.astrbot_plugin_web_searcher_pro.services.http_client import HttpClient
+            from data.plugins.astrbot_plugin_web_searcher_pro.services.searxng_service import SearxngService
+            service = SearxngService(HttpClient(timeout=12), self.base_url)
+            results = await service.search(query, category='general', limit=limit)
+            return [{'title': r.title.strip(), 'url': r.url.strip(), 'snippet': r.content.strip()[:220]}
+                    for r in results if r.url]
+        except Exception as exc:
+            logger.warning('[SearXNG] Pro ranking unavailable (%s); using original search.', type(exc).__name__)
+            return []
 
     async def terminate(self):
         pass
@@ -47,6 +78,11 @@ class SearxngSearchPlugin(Star):
             max_results(number): 返回结果条数，默认3，最多5
         """
         max_results = max(1, min(int(max_results or 3), 5))
+        if self.use_searcher_pro:
+            ranked = await self.ranked_results(query, max_results)
+            if ranked:
+                record_evidence(event, [item['url'] for item in ranked])
+                return json.dumps({'source_type':'web_search', 'query':query, 'results':ranked}, ensure_ascii=False)
         try:
             async with httpx.AsyncClient(timeout=12) as client:
                 resp = await client.get(
@@ -69,6 +105,7 @@ class SearxngSearchPlugin(Star):
             url = (r.get("url") or "").strip()
             snippet = (r.get("content") or "").strip()[:220]
             evidence.append({"title": title, "url": url, "snippet": snippet})
+        record_evidence(event, [item["url"] for item in evidence])
         return json.dumps({"source_type": "web_search", "query": query, "results": evidence}, ensure_ascii=False)
 
     @filter.llm_tool(name="fetch_web_page")
@@ -113,4 +150,5 @@ class SearxngSearchPlugin(Star):
         page = extract_page(html)
         if len(page["text"]) < 40:
             return "网页内容过少或主要为动态渲染，无法提取正文"
+        record_evidence(event, [str(resp.url)])
         return json.dumps({"source_type": "web_page", "url": str(resp.url), **page}, ensure_ascii=False)
