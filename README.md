@@ -11,8 +11,10 @@
 | **训练机**（桌面） | AMD Ryzen 7 7800X3D（8 核 16 线程，Windows 只暴露 8 个逻辑核）/ 47 GB / Radeon RX 9070 XT **16 GB**（gfx1201，ROCm 7.2.1） | 数据构建、LoRA 训练、合并、GGUF 转换与量化、A/B/C 评测 |
 | **运行机**（笔记本） | AMD Ryzen AI 7 H 350（8 核 16 线程）/ 31 GB / RTX 5060 Laptop **8 GB** + 核显 Radeon 860M | 常驻 Ollama、AstrBot、QQ 接入，单路推理 |
 
-训练机的完整实测记录在 `training/EXPERIMENT_REPORT.md`。运行机显存只有 4 GB，
-所以只有量化到 Q4_K_M 的 4B（2.52 GiB）才装得舒服；9B 的 6.6 GB 必然大量卸载到 CPU。
+训练机的完整实测记录在 `training/EXPERIMENT_REPORT.md`。运行机显存 8151 MiB（nvidia-smi 口径，约 8 GB），
+但 Ollama 给 9B（6.24 GB）实际只排了 5.46 GB 上卡、仍有 0.78 GB 留在共享内存；
+4B Q4_K_M（2.52 GiB）能全量驻留，速度也接近翻倍，所以常态用 4B，9B 留作回退。
+（早期文档按 4 GB 记，是错的，2026-10-27 用 `nvidia-smi --query-gpu=memory.total` 核实后更正。）
 
 ## 结构
 
@@ -58,7 +60,7 @@
 7. **`num_ctx` 给小了，工具一调就 500。** 上下文装不下 system（3176 字）+ 工具 schema +
    多轮工具结果时，Ollama 会截断，Qwen 的 chat template 找不到 user 消息，直接抛
    `Jinja Exception: No user query found in messages`——报错看起来像工具坏了，实际是窗口太小。
-   4B 在 4 GB 显存上 8192 仍能全量驻留（3.19 GB），别为了省显存压到 4096。
+   4B 在 8 GB 显存上 8192 仍能全量驻留（3.19 GB），别为了省显存压到 4096。
 8. **丢旧轮次治不了这个 500，得截短工具结果。** Ollama 截断是从前面丢、保住尾部，而爆窗口的
    往往是最后那条大工具结果——丢前面的会话轮次不改变尾部，怎么丢都还是 500。代理里因此是
    阶梯补救：`drop 1/2/4` → `shrink 6000/3000`，某一级不适用就跳到下一级。实测
