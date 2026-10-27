@@ -9,7 +9,7 @@
 | 机器 | 配置 | 干什么 |
 | --- | --- | --- |
 | **训练机**（桌面） | AMD Ryzen 7 7800X3D（8 核 16 线程，Windows 只暴露 8 个逻辑核）/ 47 GB / Radeon RX 9070 XT **16 GB**（gfx1201，ROCm 7.2.1） | 数据构建、LoRA 训练、合并、GGUF 转换与量化、A/B/C 评测 |
-| **运行机**（笔记本） | AMD Ryzen AI 7 H 350（8 核 16 线程）/ 31 GB / RTX 5060 Laptop **4 GB** + 核显 Radeon 860M | 常驻 Ollama、AstrBot、QQ 接入，单路推理 |
+| **运行机**（笔记本） | AMD Ryzen AI 7 H 350（8 核 16 线程）/ 31 GB / RTX 5060 Laptop **8 GB** + 核显 Radeon 860M | 常驻 Ollama、AstrBot、QQ 接入，单路推理 |
 
 训练机的完整实测记录在 `training/EXPERIMENT_REPORT.md`。运行机显存只有 4 GB，
 所以只有量化到 Q4_K_M 的 4B（2.52 GiB）才装得舒服；9B 的 6.6 GB 必然大量卸载到 CPU。
