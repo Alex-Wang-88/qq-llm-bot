@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from zoneinfo import ZoneInfo
+import math
 
 from .codex_rpc import CodexRpc, RpcError
 
@@ -41,16 +42,31 @@ def normalize_quota(raw, collected_at=None):
     return {"source":"codex account/rateLimits/read","collected_at":collected_at or datetime.now(timezone.utc).isoformat(),"windows":windows}
 
 
-def format_quota(data):
+def format_quota(data, now=None, window_minutes=None):
+    now = now or datetime.now(timezone.utc)
     lines=[]
     for window in data['windows']:
         minutes=window.get('window_minutes')
+        if window_minutes is not None and minutes != window_minutes:continue
         duration=(f"{minutes//1440} 天" if minutes and minutes%1440==0 else f"{minutes//60} 小时" if minutes and minutes%60==0 else f"{minutes} 分钟" if minutes else "未知")
         stamp=window.get('resets_at')
         reset=datetime.fromtimestamp(stamp,ZoneInfo('Asia/Shanghai')).strftime('%m-%d %H:%M') if stamp else '接口未返回'
-        lines.append(f"{window['category']}：{duration}窗口剩余 {window['remaining_percent']}%（已用 {window['used_percent']}%），重置于 {reset}。")
+        line=f"{window['category']}：{duration}窗口剩余 {window['remaining_percent']}%（已用 {window['used_percent']}%），重置于 {reset}（北京时间）"
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+            remaining=stamp-now.timestamp()
+            if remaining > 0:
+                total=math.ceil(remaining/60)
+                line+=f"，距重置约 {total//60} 小时 {total%60} 分钟"
+            else:
+                line+='，重置时间已到或已过，请稍后重新查询'
+        lines.append(line+'。')
     if not lines:lines=['接口未返回可用额度窗口。']
-    return '\n'.join(lines)+f"\n采集时间：{data['collected_at']}"
+    try:
+        collected=datetime.fromisoformat(data['collected_at'].replace('Z','+00:00'))
+        collected=collected.astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')+'（北京时间）'
+    except (ValueError, TypeError, KeyError, AttributeError):
+        collected='未知'
+    return '\n'.join(lines)+f"\n查询时间：{collected}"
 
 
 class CodexAdapter:
@@ -97,6 +113,10 @@ class CodexAdapter:
     async def send(self, identity, text):
         if identity not in self.exclusive_sessions:
             return Result(Capability.UNSUPPORTED,reason="该会话尚未独占交接；本机桌面共享控制端点不可达，不能用独立 App Server 冒充桌面客户端写入。")
+        current=await self.client.request('thread/read',{'threadId':identity,'includeTurns':False})
+        state=(current.get('thread') or {}).get('status') or {}
+        if state.get('type')=='active':
+            return Result(Capability.UNSUPPORTED,reason='该会话当前正在执行；不能并发启动新回合。')
         # Explicitly handed-over sessions retain their native ID. No new thread
         # or fork is created. Approval remains on-request, not auto-approved.
         await self.client.request("thread/resume",{"threadId":identity,"excludeTurns":True,"approvalPolicy":"on-request","sandbox":"workspace-write"})

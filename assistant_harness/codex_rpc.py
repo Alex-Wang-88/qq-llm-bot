@@ -106,6 +106,7 @@ class CodexRpc:
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self.ready = False
+        self.events_lost = False
 
     async def start(self):
         async with self._start_lock:
@@ -116,6 +117,7 @@ class CodexRpc:
             await self._start()
 
     async def _start(self):
+        self.events_lost = False
         flags = 0
         if os.name == "nt":
             flags = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
@@ -174,6 +176,7 @@ class CodexRpc:
                         if "id" in message:
                             await self._write({"id":message["id"],"error":{"code":-32000,"message":"Approval queue unavailable; request not approved"}})
                             continue
+                        self.events_lost = True
                         queue.get_nowait()
                     queue.put_nowait(message)
                 elif (future := self.pending.get(message.get("id"))) and not future.done():

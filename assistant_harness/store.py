@@ -17,6 +17,8 @@ class SessionStore:
           CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY,harness TEXT NOT NULL,native_id TEXT NOT NULL,project_path TEXT,title TEXT,status TEXT,observed_at REAL,UNIQUE(harness,native_id));
           CREATE TABLE IF NOT EXISTS bindings(actor TEXT PRIMARY KEY,session_id INTEGER NOT NULL,expires_at REAL NOT NULL);
           CREATE TABLE IF NOT EXISTS notifications(event_key TEXT PRIMARY KEY,actor TEXT NOT NULL,session_id INTEGER,qq_message_id TEXT,state TEXT NOT NULL,payload TEXT,created_at REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS pending_messages(actor TEXT PRIMARY KEY,content TEXT NOT NULL,expires_at REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS tracked_turns(harness TEXT NOT NULL,native_id TEXT NOT NULL,turn_id TEXT NOT NULL,actor TEXT NOT NULL,session_id INTEGER NOT NULL,status TEXT NOT NULL,started_at REAL,updated_at REAL NOT NULL,PRIMARY KEY(harness,native_id,turn_id));
         ''')
 
     def close(self): self.db.close()
@@ -56,3 +58,57 @@ class SessionStore:
         row=self.db.execute('SELECT session_id FROM notifications WHERE actor=? AND qq_message_id=? AND state=?',(actor,message_id,'delivered')).fetchone()
         if not row or row['session_id'] is None:return None
         return self.resolve(str(row['session_id']))
+
+    def stage_message(self,actor,text,ttl=300):
+        if not isinstance(text,str) or not text.strip():raise ValueError('续聊内容不能为空。')
+        if len(text)>4000:raise ValueError('续聊内容超过 4000 字。')
+        with self.db:
+            self.db.execute('DELETE FROM pending_messages WHERE expires_at<?',(time.time(),))
+            self.db.execute('INSERT OR REPLACE INTO pending_messages VALUES(?,?,?)',(actor,text,time.time()+ttl))
+
+    def cleanup_pending(self,now=None):
+        now=time.time() if now is None else now
+        with self.db:self.db.execute('DELETE FROM pending_messages WHERE expires_at<?',(now,))
+
+    def consume_message(self,actor,now=None):
+        now=time.time() if now is None else now
+        with self.db:
+            row=self.db.execute('DELETE FROM pending_messages WHERE actor=? RETURNING *',(actor,)).fetchone()
+        if not row or row['expires_at']<now:raise ValueError('待确认消息不存在或已过期，请重新发送。')
+        return row['content']
+
+    def register_turn(self,actor,target,turn_id):
+        if not isinstance(turn_id,str) or not turn_id:raise ValueError('Harness 未返回回合 ID，无法跟踪。')
+        with self.db:
+            self.db.execute('INSERT INTO tracked_turns VALUES(?,?,?,?,?,?,?,?)',
+                (target['harness'],target['native_id'],turn_id,actor,target['id'],'accepted',None,time.time()))
+
+    def observe_turn(self,harness,native_id,turn_id,status,now=None):
+        if status not in ('inProgress','completed','failed','interrupted'):return None
+        now=time.time() if now is None else now
+        with self.db:
+            row=self.db.execute('SELECT * FROM tracked_turns WHERE harness=? AND native_id=? AND turn_id=?',
+                                (harness,native_id,turn_id)).fetchone()
+            if not row or row['status'] not in ('accepted','inProgress'):return None
+            started=row['started_at'] or (now if status=='inProgress' else None)
+            self.db.execute('UPDATE tracked_turns SET status=?,started_at=?,updated_at=? WHERE harness=? AND native_id=? AND turn_id=?',
+                            (status,started,now,harness,native_id,turn_id))
+            return dict(row)
+
+    def tracked(self,actor):
+        return [dict(row) for row in self.db.execute('SELECT * FROM tracked_turns WHERE actor=? ORDER BY updated_at DESC LIMIT 10',(actor,))]
+
+    def mark_tracking_unknown(self):
+        with self.db:self.db.execute("UPDATE tracked_turns SET status='unknown',updated_at=? WHERE status IN ('accepted','inProgress')",(time.time(),))
+
+    def mark_pending_notifications_unknown(self):
+        with self.db:self.db.execute("UPDATE notifications SET state='delivery_unknown' WHERE state='pending'")
+
+    def reserve_notification(self,key,actor,session_id):
+        with self.db:
+            row=self.db.execute('INSERT OR IGNORE INTO notifications VALUES(?,?,?,?,?,?,?)',(key,actor,session_id,None,'pending','{}',time.time()))
+            return row.rowcount==1
+
+    def finish_notification(self,key,state,message_id=None):
+        if state not in ('delivered','delivery_unknown'):raise ValueError('invalid delivery state')
+        with self.db:self.db.execute('UPDATE notifications SET state=?,qq_message_id=? WHERE event_key=? AND state=?',(state,message_id,key,'pending'))
