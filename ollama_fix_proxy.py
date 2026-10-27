@@ -18,6 +18,98 @@ BACKEND_LOCK = threading.Lock()
 HOP_HEADERS = {"transfer-encoding", "content-length", "connection", "keep-alive"}
 LOG = logging.getLogger(__name__)
 
+REQUEST_TIMEOUT = 120
+# 上下文溢出的补救阶梯，从最温和到最激进。实测（2026-10-27）单靠丢旧轮次治不了：
+# 爆窗口的往往是尾部那条大工具结果，丢前面根本不改变尾部，最后还是 500。所以
+# 前三级丢轮次、后两级把工具结果截短——这才是能真正救回来的那一步。
+REPAIR_STEPS = (
+    ("drop", 1),
+    ("drop", 2),
+    ("drop", 4),
+    ("shrink", 6000),
+    ("shrink", 3000),
+)
+MAX_CONTEXT_RETRIES = len(REPAIR_STEPS)
+# Ollama 在上下文装不下时不会报"太长"，而是把消息截断到模板认不出来，然后抛
+# Jinja 异常——所以只能按错误文本识别，不能按状态码。
+OVERFLOW_MARKERS = (
+    "No user query found",
+    "exceeds the available context size",
+    "input length exceeds",
+)
+
+
+def is_context_overflow(status, body):
+    """True when upstream rejected the request because the context did not fit."""
+    if status != 500:
+        return False
+    text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+    return any(marker in text for marker in OVERFLOW_MARKERS)
+
+
+def drop_oldest_round(messages):
+    """丢掉最旧的一轮对话，保留 system 与其余轮次；无可丢时返回 None。
+
+    按"下一个 user 消息"整段切，而不是按条数切：OpenAI 协议要求 assistant 的
+    tool_calls 后面紧跟 tool 结果，按条数切会把配对拆开，上游会直接 400。
+    """
+    if not isinstance(messages, list) or not messages:
+        return None
+    start = 1 if isinstance(messages[0], dict) and messages[0].get("role") == "system" else 0
+    seen_user = 0
+    for index in range(start, len(messages)):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "user":
+            seen_user += 1
+            if seen_user == 2:  # 第一条 user 到第二条之前，正好是一整轮
+                return messages[:start] + messages[index:]
+    return None
+
+
+def drop_oldest_rounds(messages, count=1):
+    """丢掉最旧的 count 轮；一轮都丢不掉时返回 None，避免空转重试。"""
+    dropped = False
+    for _ in range(max(1, count)):
+        trimmed = drop_oldest_round(messages)
+        if trimmed is None:
+            break
+        messages, dropped = trimmed, True
+    return messages if dropped else None
+
+
+def clip_text(text, limit):
+    """保留头和尾，中间说明截掉了多少——搜索结果的有用部分通常就在前面。"""
+    if len(text) <= limit:
+        return text
+    head = text[: limit * 2 // 3]
+    tail = text[-(limit // 3):]
+    return f"{head}\n…（原文 {len(text)} 字，已截断）…\n{tail}"
+
+
+def shrink_tool_results(messages, limit):
+    """把所有超长的 tool 结果截到 limit 字；没有可截的返回 None。"""
+    if not isinstance(messages, list):
+        return None
+    changed = False
+    trimmed = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            content = message.get("content")
+            if isinstance(content, str) and len(content) > limit:
+                message = dict(message, content=clip_text(content, limit))
+                changed = True
+        trimmed.append(message)
+    return trimmed if changed else None
+
+
+def apply_repair(messages, kind, amount):
+    """执行一级补救；这一步不适用时返回 None，由调用方换下一级。"""
+    if kind == "drop":
+        return drop_oldest_rounds(messages, amount)
+    if kind == "shrink":
+        return shrink_tool_results(messages, amount)
+    return None
+
 
 def flatten_content(messages):
     """Flatten text-only parts. Keep multimodal messages intact, including images."""
@@ -127,20 +219,59 @@ class Handler(BaseHTTPRequestHandler):
         except ConnectionError:
             self.close_connection=True
 
+    def _open(self, body):
+        request = urllib.request.Request(TARGET + self.path, data=body, method="POST")
+        for key in ("Content-Type", "Authorization"):
+            if self.headers.get(key):
+                request.add_header(key, self.headers[key])
+        return urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT)
+
+    def _forward(self, body, payload):
+        """转发一次，遇上下文溢出就按 REPAIR_STEPS 逐级补救后重试。
+
+        返回上游响应对象；返回 None 表示已经回过错误，调用方直接结束。
+        只有 /v1/chat/completions 带 payload，其它路径一律原样透传。
+        """
+        step = 0
+        while True:
+            try:
+                return self._open(body)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read()
+                content_type = exc.headers.get("Content-Type", "application/json")
+                repaired = None
+                if payload is not None and is_context_overflow(exc.code, detail):
+                    # 跳过不适用的级别（没有旧轮次可丢、没有工具结果可截），
+                    # 而不是就此放弃——最后那条大工具结果才是最常见的元凶。
+                    while step < len(REPAIR_STEPS) and repaired is None:
+                        kind, amount = REPAIR_STEPS[step]
+                        step += 1
+                        repaired = apply_repair(payload.get("messages"), kind, amount)
+                if repaired is None:
+                    self._reply(exc.code, detail, content_type)
+                    return None
+                payload["messages"] = repaired
+                body = json.dumps(prepare_payload(payload), ensure_ascii=False).encode("utf-8")
+                save_json("_last_forwarded_request.json", payload)
+                LOG.warning(
+                    "context overflow: repair %d/%d (%s %s), %d messages left",
+                    step, len(REPAIR_STEPS), kind, amount, len(repaired),
+                )
+
     def do_POST(self):
         try:
             body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             with BACKEND_LOCK:
+                payload = None
                 if self.path == "/v1/chat/completions":
-                    data = json.loads(body)
-                    save_json("_last_request.json", data)
-                    body = json.dumps(prepare_payload(data), ensure_ascii=False).encode("utf-8")
-                    save_json("_last_forwarded_request.json", data)
-                req = urllib.request.Request(TARGET + self.path, data=body, method="POST")
-                for key in ("Content-Type", "Authorization"):
-                    if self.headers.get(key):
-                        req.add_header(key, self.headers[key])
-                with urllib.request.urlopen(req, timeout=120) as resp:
+                    payload = json.loads(body)
+                    save_json("_last_request.json", payload)
+                    body = json.dumps(prepare_payload(payload), ensure_ascii=False).encode("utf-8")
+                    save_json("_last_forwarded_request.json", payload)
+                resp = self._forward(body, payload)
+                if resp is None:  # 已经回过错误（或重试用尽）
+                    return
+                with resp:
                     streaming = "text/event-stream" in resp.headers.get("Content-Type", "")
                     if streaming:
                         self.send_response(resp.status)

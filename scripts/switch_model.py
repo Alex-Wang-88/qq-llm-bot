@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('profile',choices=['qwen3','qwen35']);args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('profile',choices=['qwen3','qwen35','qwen35_4b']);args=parser.parse_args()
     profile=json.loads((ROOT/'config/model_profiles.json').read_text(encoding='utf-8'))[args.profile]
     request=urllib.request.Request('http://127.0.0.1:11434/api/show',data=json.dumps({'model':profile['model']}).encode(),headers={'Content-Type':'application/json'})
     with urllib.request.urlopen(request,timeout=10) as response:metadata=json.load(response)

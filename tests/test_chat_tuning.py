@@ -27,6 +27,9 @@ proxy = load("tuned_proxy", "ollama_fix_proxy.py")
 tuning = load("tuned_config", "scripts/apply_chat_tuning.py")
 web = load("page_extract", "data/plugins/astrbot_plugin_searxng_search/web_text.py")
 natural = load("natural_plugin_test", "data/plugins/astrbot_plugin_chat_natural/main.py")
+# 插件的闲置阈值状态默认落在 data/plugin_data/ 下；测试必须指到临时目录，
+# 否则 prepare_chat 会把假的 UMO 写进真实的 session_state.json。
+natural.SESSION_STATE = Path(tempfile.mkdtemp(prefix="chat-tuning-state-")) / "session_state.json"
 
 
 class Event:
@@ -342,13 +345,24 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.release = threading.Event()
         self.started = threading.Event()
+        self.attempts = []          # 上游实际收到的请求，用来数重试次数
+        self.overflow_failures = 0  # 前几次返回"上下文溢出"
         owner = self
 
         class Upstream(BaseHTTPRequestHandler):
             def do_POST(self):
                 payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                owner.attempts.append(payload)
                 if payload.get("fail"):
                     self.send_response(503); self.end_headers(); self.wfile.write(b'{"error":"busy"}'); return
+                if payload.get("broken"):
+                    body = b'{"error":{"message":"model crashed"}}'
+                    self.send_response(500); self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                if payload.get("overflow") and len(owner.attempts) <= owner.overflow_failures:
+                    body = b'{"error":{"message":"Jinja Exception: No user query found in messages."}}'
+                    self.send_response(500); self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
                 if payload.get("stream"):
                     self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
                     self.wfile.write(b'data: {"delta":"first"}\n\n'); self.wfile.flush(); owner.started.set()
@@ -398,6 +412,87 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertEqual(data["messages"][-1]["content"], "hello")
         self.assertEqual(data["max_tokens"], 384)
         self.assertTrue((Path(self.temp.name)/"_last_forwarded_request.json").exists())
+        connection.close()
+
+
+    def test_context_overflow_drops_the_oldest_round_and_retries(self):
+        self.overflow_failures = 1
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "旧问题"},
+            {"role": "assistant", "content": "旧回答"},
+            {"role": "user", "content": "新问题"},
+        ]
+        connection, response = self.request({"overflow": True, "messages": messages})
+        self.assertEqual(response.status, 200)
+        forwarded = json.loads(response.read())["messages"]
+        self.assertEqual([m["role"] for m in forwarded], ["system", "user"])
+        self.assertEqual(forwarded[1]["content"], "新问题")
+        self.assertEqual(len(self.attempts), 2)
+        connection.close()
+
+    def test_overflow_retry_is_bounded(self):
+        # 丢轮次的三级都适用（有 10 轮），截短的两级不适用（没有 tool 消息），
+        # 所以到此为止，不会一直重试下去。
+        self.overflow_failures = 99
+        messages = [{"role": "system", "content": "sys"}]
+        for index in range(10):
+            messages.append({"role": "user", "content": f"q{index}"})
+            messages.append({"role": "assistant", "content": f"a{index}"})
+        connection, response = self.request({"overflow": True, "messages": messages})
+        self.assertEqual(response.status, 500)
+        self.assertLessEqual(len(self.attempts), proxy.MAX_CONTEXT_RETRIES + 1)
+        self.assertGreaterEqual(len(self.attempts), 2)
+        connection.close()
+
+    def test_huge_tool_result_is_shrunk_when_no_round_can_be_dropped(self):
+        # 实测过的真实形态：只有一条 user，末尾是一条 2 万字的工具结果。
+        # 丢轮次一级都走不通，必须靠截短才救得回来。
+        self.overflow_failures = 1
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "今天A股高开还是低开"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "搜" * 20000},
+        ]
+        connection, response = self.request({"overflow": True, "messages": messages})
+        self.assertEqual(response.status, 200)
+        forwarded = json.loads(response.read())["messages"]
+        self.assertEqual([m["role"] for m in forwarded], ["system", "user", "assistant", "tool"])
+        self.assertLess(len(forwarded[-1]["content"]), 7000)
+        self.assertIn("已截断", forwarded[-1]["content"])
+        self.assertEqual(len(self.attempts), 2)
+        connection.close()
+
+    def test_dropped_round_never_orphans_a_tool_message(self):
+        # 按条数切会把 assistant.tool_calls 和它的 tool 结果拆开，上游会直接 400。
+        self.overflow_failures = 1
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "旧问题"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "搜索结果"},
+            {"role": "assistant", "content": "旧回答"},
+            {"role": "user", "content": "新问题"},
+        ]
+        connection, response = self.request({"overflow": True, "messages": messages})
+        forwarded = json.loads(response.read())["messages"]
+        self.assertEqual([m["role"] for m in forwarded], ["system", "user"])
+        connection.close()
+
+    def test_unrelated_upstream_500_is_not_retried(self):
+        connection, response = self.request({"broken": True, "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(response.status, 500)
+        self.assertEqual(json.loads(response.read()), {"error": {"message": "model crashed"}})
+        self.assertEqual(len(self.attempts), 1)
+        connection.close()
+
+    def test_overflow_that_cannot_be_trimmed_is_forwarded(self):
+        self.overflow_failures = 99
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "只有一个问题"}]
+        connection, response = self.request({"overflow": True, "messages": messages})
+        self.assertEqual(response.status, 500)
+        self.assertEqual(len(self.attempts), 1)
         connection.close()
 
 

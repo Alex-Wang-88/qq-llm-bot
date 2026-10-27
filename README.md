@@ -4,25 +4,33 @@
 它记录的是把一个小模型调到**像个真人在 QQ 上说话**的过程：压住输出预算、管住气泡数量、
 管住它别把"我这就去查"当成回答发出去，以及顺手接了个只读查本机 Codex 会话的入口。
 
-跑在本机 AMD Ryzen 7 7800X3D（8 核）/ 47 GB 内存 / Radeon RX 9070 XT（16 GB 显存）上，
-单路推理，够用。实测环境记录在 `training/EXPERIMENT_REPORT.md`。
+两台机器，职责分得很清楚：
+
+| 机器 | 配置 | 干什么 |
+| --- | --- | --- |
+| **训练机**（桌面） | AMD Ryzen 7 7800X3D（8 核 16 线程，Windows 只暴露 8 个逻辑核）/ 47 GB / Radeon RX 9070 XT **16 GB**（gfx1201，ROCm 7.2.1） | 数据构建、LoRA 训练、合并、GGUF 转换与量化、A/B/C 评测 |
+| **运行机**（笔记本） | AMD Ryzen AI 7 H 350（8 核 16 线程）/ 31 GB / RTX 5060 Laptop **4 GB** + 核显 Radeon 860M | 常驻 Ollama、AstrBot、QQ 接入，单路推理 |
+
+训练机的完整实测记录在 `training/EXPERIMENT_REPORT.md`。运行机显存只有 4 GB，
+所以只有量化到 Q4_K_M 的 4B（2.52 GiB）才装得舒服；9B 的 6.6 GB 必然大量卸载到 CPU。
 
 ## 结构
 
 | 路径 | 作用 |
 | --- | --- |
-| `ollama_fix_proxy.py` | 8899 端口上的兼容代理。拍平 text parts、`reasoning`→`reasoning_content`、按 `response_budget` 限 token（brief 384 / expanded 2048）、串行转发、出口净化 |
+| `ollama_fix_proxy.py` | 8899 端口上的兼容代理。拍平 text parts、`reasoning`→`reasoning_content`、按 `response_budget` 限 token（brief 384 / expanded 2048）、串行转发、出口净化、上下文溢出阶梯补救 |
 | `assistant_output_guard.py` | 出口净化：剥掉模型自己续写的 `user`/`assistant` 轮与 `<think>` 块，流式与非流式结果逐字一致 |
-| `assistant_dialogue.py` | 廉价意图分类（chat / query / computer / harness），只影响策略，不改权限 |
+| `assistant_dialogue.py` | 廉价意图分类（chat / query / math / computer / harness），只影响策略，不改权限 |
+| `assistant_calc.py` | 算术求值：`ast` 节点白名单 + `Fraction`，不用 `eval`。纯算式由代码直接回，句中算式只注入核验结果 |
 | `assistant_security.py` | 出站文本脱敏 |
 | `assistant_harness/` | Codex App Server 的 JSONL 传输层与能力适配器，只读查询会话与额度 |
 | `data/plugins/astrbot_plugin_chat_natural/` | 聊天策略：工具白名单、历史清理、气泡形状、表情节奏 |
 | `data/plugins/astrbot_plugin_harness_manager/` | `/助手` 命令：查会话、读结果、查额度 |
 | `data/plugins/astrbot_plugin_searxng_search/` | 搜索插件（正文提取部分被改过） |
-| `config/` | 人设、Ollama Modelfile、模型档位 |
+| `config/` | 人设、Ollama Modelfile、模型档位、会话闲置阈值（`session_policy.json`） |
 | `scripts/` | 启动、预检、离线探针 |
 | `training/` | 离线微调工作区：数据构建、训练、评测、adapter 合并、GGUF 导出，入口 `training/README.md` |
-| `tests/` | 回归测试，88 项 |
+| `tests/` | 回归测试，149 项 |
 
 ## 修过的几个坑
 
@@ -39,12 +47,33 @@
    同时存在时，PowerShell 5.1 复制环境块抛 `ArgumentException`，脚本在写任何日志之前就退出。
 5. **默认的"分段回复"按句号切。** 判定是 `len(text) > 阈值` 时**不分段**，很容易被误读成相反行为，
    实际效果是短回复被切碎、长回复整条发。本仓库把阈值设 0，气泡数改由插件按内容结构决定。
-6. **让回复变长，会带出角色边界失控。** 微调后的 4B 不再说完一句就停，但也开始自己续写
+6. **`/v1/chat/completions` 不认 `think: false`。** Ollama 的原生 `/api/chat` 关得掉，
+   OpenAI 兼容层关不掉——`think`、`chat_template_kwargs.enable_thinking`、`options.think`
+   实测全部无效，一句"今天天气不错"烧掉 1238–2399 token 的思考。`/v1` 上唯一有效的是
+   `reasoning_effort: "none"`（7 token）。AstrBot 的 provider 走 `/v1`，所以这项必须写进
+   `config/model_profiles.json` 的 generation，否则响应预算全被思考吃掉。
+7. **`num_ctx` 给小了，工具一调就 500。** 上下文装不下 system（3176 字）+ 工具 schema +
+   多轮工具结果时，Ollama 会截断，Qwen 的 chat template 找不到 user 消息，直接抛
+   `Jinja Exception: No user query found in messages`——报错看起来像工具坏了，实际是窗口太小。
+   4B 在 4 GB 显存上 8192 仍能全量驻留（3.19 GB），别为了省显存压到 4096。
+8. **丢旧轮次治不了这个 500，得截短工具结果。** Ollama 截断是从前面丢、保住尾部，而爆窗口的
+   往往是最后那条大工具结果——丢前面的会话轮次不改变尾部，怎么丢都还是 500。代理里因此是
+   阶梯补救：`drop 1/2/4` → `shrink 6000/3000`，某一级不适用就跳到下一级。实测
+   「1 条 user + 4 万字工具结果」这种形态，只能靠截短救回来。
+9. **让回复变长，会带出角色边界失控。** 微调后的 4B 不再说完一句就停，但也开始自己续写
    `user`/`assistant` 行和空 `<think>` 块，一路循环到 token 上限——有 26 个评测用例里 1 条这样。
    训练集里这两个东西一个都没有，所以这是基座的对话先验，不是重训能收敛掉的。
    `assistant_output_guard.py` 在代理出口做兜底：整行只有角色名就截断、剥掉 think 块、
    流式输出与整段输出结果逐字一致（否则流式会漏）。78 条真实评测输出回放，只改动该改的 2 条，
    其余 76 条一字未动。
+10. **`on_llm_request` 里光 `set_result` 是发不出去的。** `internal.py` 拿到 hook 结果后直接
+   `if await call_event_hook(...): return`，而它的第一个 `yield` 在这之后——所以事件被
+   `stop_event()` 之后 ProcessStage 一个 yield 都不产出，respond 阶段压根不执行，消息静默消失。
+   想短路（例如纯算式不经模型）必须自己 `await event.send(MessageChain([Plain(text)]))`，
+   然后再 `stop_event()`。
+11. **别指望模型算数。** 4B 对 `23 × 7 - 18` 连错三次（64 / 81 / 169），9B 给 141，训练报告里
+    记着同一个失败模式（"跳过步骤直接猜"）。这是能力问题，改提示词无效——算术交给
+    `assistant_calc.py`，模型只负责把结果说成人话。
 
 细节和证据都在 `开发进度.md`。
 

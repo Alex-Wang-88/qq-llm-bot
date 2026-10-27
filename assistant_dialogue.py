@@ -5,6 +5,9 @@ import re
 HARNESS=re.compile(r'codex|workbuddy|zcode',re.I)
 QUERY=re.compile(r'https?://|搜索|搜一下|搜一遍|再搜|查一下|查一遍|查查|再查|最新|实时|新闻|天气|价格|行情|指数|网页|链接|版本')
 COMPUTER=re.compile(r'(?:打开|启动|停止|关掉|查找|压缩|整理|查看|检查).{0,16}(?:软件|程序|进程|文件|目录|磁盘|CPU|GPU|内存|显存|日志|下载)',re.I)
+# 算式：判断只影响提示词口径，真正的求值在 assistant_calc。放在 COMPUTER 之后、
+# QUERY 之前——"查一下 1280/4"是算术，不该被当成联网搜索。
+MATH=re.compile(r'\d\s*(?:\*\*|//|[+\-*/×÷^%])\s*[\d(]')
 DEEP=re.compile(r'^\s*(?:请)?(?:深度思考|认真推理|/思考)\s*[:：\s]')
 
 
@@ -20,6 +23,7 @@ def classify(text):
     elif HARNESS.search(text) and re.search(r'继续|发送|发给|交给|让|会话|任务|额度|状态|进度|查询|查看',text):mode='harness'
     elif re.search(r'任务(?:状态|进度)|剩余.{0,5}额度|哪个.{0,8}会话',text):mode='harness'
     elif COMPUTER.search(text):mode='computer'
+    elif MATH.search(text):mode='math'
     elif QUERY.search(text):mode='query'
     else:mode='chat'
     return Intent(mode,thinking)

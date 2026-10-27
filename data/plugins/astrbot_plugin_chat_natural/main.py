@@ -5,14 +5,16 @@ import json
 from pathlib import Path
 import re
 import sys
+import time
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.api.message_components import Plain
 ROOT=Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:sys.path.insert(0,str(ROOT))
+from assistant_calc import find_facts, solve
 from assistant_dialogue import classify
 
 PERSONA = "千问娘"
@@ -42,6 +44,54 @@ ANNOUNCEMENT_LIMIT = 24
 # is decided here from sentence structure, not by AstrBot's punctuation cutter.
 BUBBLE_LIMIT = 320
 BUBBLE_MIN_SIDE = 40
+
+# 闲置自动开新会话。
+# 起因（2026-10-27 实测）：QQ 客户端里"新开一个聊天"并不等于新会话，AstrBot 按
+# `platform:FriendMessage:<openid>` 复用同一个 conversation，隔天再聊还带着前一天的
+# 摘要（"Our previous history conversation summary: ..."）。所以这里按 UMO 记最后活跃
+# 时间，静默超过阈值就把上下文清掉，行为上等价于用户发了 /reset。
+# 阈值写在 config/session_policy.json，缺省 8 小时；设 0 表示关闭。
+DEFAULT_IDLE_HOURS = 8.0
+SESSION_STATE = ROOT / "data" / "plugin_data" / "astrbot_plugin_chat_natural" / "session_state.json"
+SESSION_CONFIG = ROOT / "config" / "session_policy.json"
+SESSION_STATE_LIMIT = 200
+
+
+def idle_seconds():
+    """从 config/session_policy.json 读闲置阈值，读不到就用缺省值。"""
+    try:
+        raw = json.loads(SESSION_CONFIG.read_text(encoding="utf-8"))
+        hours = float(raw.get("idle_reset_hours", DEFAULT_IDLE_HOURS))
+    except (OSError, ValueError, TypeError):
+        hours = DEFAULT_IDLE_HOURS
+    return max(0.0, hours) * 3600
+
+
+def should_reset_session(now, last_seen, idle):
+    """首次出现的会话不重置；静默超过 idle 秒才重置；idle<=0 关闭该行为。"""
+    if last_seen is None or idle <= 0:
+        return False
+    return now - last_seen > idle
+
+
+def load_session_state(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): float(value) for key, value in data.items()
+            if isinstance(value, (int, float))}
+
+
+def save_session_state(path, state):
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def known_memes():
@@ -101,6 +151,7 @@ class NaturalChatPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self._meme_history = OrderedDict()
+        self._last_active = load_session_state(SESSION_STATE)
 
     def _matches(self, event):
         persona = event.get_extra("_trace_persona_id")
@@ -157,10 +208,82 @@ class NaturalChatPlugin(Star):
                 kept.append(message)
         contexts[:] = kept
 
+    async def _apply_idle_reset(self, event, req):
+        """静默太久就开新会话：清 DB 历史 + 清本轮上下文，行为等价于 /reset。
+
+        失败不能影响正常回复，所以整段包在 try 里；状态文件写不进去也只是退回
+        "不重置"，不会让消息丢掉。
+        """
+        umo = event.unified_msg_origin
+        now = time.time()
+        previous = self._last_active.get(umo)
+        idle = idle_seconds()
+        if should_reset_session(now, previous, idle):
+            cleared_db = False
+            try:
+                manager = getattr(self.context, "conversation_manager", None)
+                if manager is not None:
+                    conversation_id = await manager.get_curr_conversation_id(umo)
+                    if conversation_id:
+                        await manager.update_conversation(umo, conversation_id, history=[])
+                        cleared_db = True
+            except Exception as exc:  # noqa: BLE001 - 清理失败不该拦住这条消息
+                logger.warning(f"[chat_natural] 闲置重置时清 DB 历史失败：{exc}")
+            contexts = getattr(req, "contexts", None)
+            dropped = len(contexts) if isinstance(contexts, list) else 0
+            if isinstance(contexts, list):
+                contexts.clear()
+            logger.info(
+                f"[chat_natural] 闲置 {(now - previous) / 3600:.1f}h 超过阈值 "
+                f"{idle / 3600:.1f}h，开新会话：丢弃上下文 {dropped} 条，DB 历史已清={cleared_db}"
+            )
+            event.set_extra("chat_natural_session_reset", True)
+        self._last_active[umo] = now
+        if len(self._last_active) > SESSION_STATE_LIMIT:
+            for key in sorted(self._last_active, key=self._last_active.get)[:SESSION_STATE_LIMIT // 2]:
+                self._last_active.pop(key, None)
+        save_session_state(SESSION_STATE, self._last_active)
+
+    async def _apply_math(self, event, req):
+        """纯算式由本地求值直接回复，不经模型；句中算式只注入核验结果。
+
+        AstrBot 4.29.3 没有"hook 返回即回复"的约定：`internal.py` 在调用完
+        on_llm_request 后立刻 `if ...: return`，而它的第一个 yield 在这之后，
+        所以 stop_event() 会让 ProcessStage 一个 yield 都不产出，respond 阶段
+        根本不会执行——`set_result` 发不出去。要短路就必须自己把消息发出去。
+        """
+        prompt = getattr(req, "prompt", "") or ""
+        if not isinstance(prompt, str) or not prompt.strip():
+            return False
+        answer = solve(prompt)
+        if answer:
+            await event.send(MessageChain([Plain(answer)]))
+            event.stop_event()
+            logger.info(f"[chat_natural] 纯算式本地求值，直接回复：{answer}")
+            return True
+        facts = find_facts(prompt)
+        if facts:
+            block = "；".join(f"{expression} = {value}" for expression, value in facts)
+            req.system_prompt += (
+                "\n算术结果已由代码核验（照抄数字，不要自己重算也不要改写）："
+                f"{block}\n"
+            )
+            logger.info(f"[chat_natural] 句内算式已核验：{block}")
+        return False
+
     @filter.on_llm_request(priority=-100)
     async def prepare_chat(self, event: AstrMessageEvent, req: ProviderRequest):
         if not self._matches(event):
             return
+        try:
+            await self._apply_idle_reset(event, req)
+        except Exception as exc:  # noqa: BLE001 - 会话重置永远不能挡住回复
+            logger.warning(f"[chat_natural] 闲置重置异常，按原上下文继续：{exc}")
+        try:
+            if await self._apply_math(event, req):
+                return
+        except Exception as exc:  # noqa: BLE001 - 算不出来就退回模型
+            logger.warning(f"[chat_natural] 本地求值异常，交给模型：{exc}")
         self._clean_history(req)
         intent=classify(req.prompt or "")
         allowed=set(ALLOWED_TOOLS)
@@ -180,6 +303,8 @@ class NaturalChatPlugin(Star):
             guidance+='只能只读查询 Harness，没有发送指令工具；不能说已发送或已指派。目标不明确就请对方指定。'
         elif intent.mode=='computer':
             guidance+='没有真实电脑工具执行结果时，只能说明当前能力或待执行，不能声称已操作。'
+        elif intent.mode=='math':
+            guidance+='上面已给出代码核验过的结果就直接采信，照抄数字、不要重算；没有核验结果时先把算式写出来再算，别跳步。'
         elif intent.mode=='query':
             guidance+='需要实时数据或最新事实时，先调用 web_search 拿结果：调用工具那一轮只发工具调用，不附带任何文字；结果到手后一次性说结论，第一句是关键数字或结论，后面补一句判断，最后一句停在结论上。'
         else:
